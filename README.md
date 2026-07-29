@@ -38,7 +38,6 @@ FoliaCompat is a zero-dependency drop-in plugin that bridges every Bukkit/Paper 
 | Unsafe plugin constructor bypass | ✅ Works | `Unsafe.allocateInstance()` + null collection field init |
 | `/fc load`, `/fc unload`, `/fc reload`, `/fc list` commands | ✅ Works | With tab completion and `foliacompat.admin` permission |
 | Full class hierarchy coverage | ✅ Works | `CraftHumanEntity`, `CraftLivingEntity`, others generated on demand |
-| Auto-update detection (Modrinth) | ✅ Works | Checks for new releases at startup via Modrinth API |
 
 
 

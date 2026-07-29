@@ -2,3 +2,5 @@ build/
 .gradle/
 *.jar
 bin/
+AGENTS.md
+PLAN.md
