@@ -69,13 +69,20 @@ FoliaCompat is a zero-dependency drop-in plugin that bridges every Bukkit/Paper 
 <summary><b>View config.yml</b></summary>
 
 ```yaml
-config-version: 3
+# --- Internal config version ---
+config-version: 4
 
+# --- Plugin cache ---
 reset-cache-on-restart: false
 
+# --- Error reporting ---
 error-reporting:
   enabled: true
 
+# --- Modrinth update checking ---
+modrinth-update-check: true
+
+# --- Debug logging ---
 debug: false
 ```
 
