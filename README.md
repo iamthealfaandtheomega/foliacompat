@@ -31,13 +31,13 @@ FoliaCompat is a zero-dependency drop-in plugin that bridges every Bukkit/Paper 
 | Shutdown NPE protection | ✅ Fixed | Daemon watcher + instance protection + re-injection; no more `CraftScheduler.getActiveWorkers()` null |
 | Scheduler error reporting to Discord | ✅ Works | All scheduler lambdas wrapped with `DiscordReporter.report()` on Throwable |
 | Plugin bytecode patching (NMS → mapped names) | ✅ Works | Constant pool Utf8 rewriting at `findClass()` time via custom classloader |
-| Plugin bytecode patching (CraftBukkit renames) | ✅ Works | Runtime-probed fallback map + hardcoded fallbacks |
-| Synthetic CraftBukkit entity classes | ✅ Works | `CraftHumanEntity` → `CraftEntity`, `CraftLivingEntity` → `CraftEntity` |
-| ObfHelper / reobf.tiny mapping resolution | ✅ Works | With lazy-init handling and `mappingsByObfName()` API support |
+| Plugin bytecode patching (CraftBukkit renames) | ⚠️ Experimental | Runtime-probed fallback map + hardcoded fallbacks; version-dependent |
+| Synthetic CraftBukkit entity classes | ⚠️ Experimental | `CraftHumanEntity` → `CraftEntity`, `CraftLivingEntity` → `CraftEntity`; hierarchy guessed, some edge cases |
+| ObfHelper / reobf.tiny mapping resolution | ⚠️ Experimental | Lazy-init handling and `mappingsByObfName()` API; depends on ObfHelper availability |
 | Plugin cache (skip re-patch on restart) | ✅ Works | Patched bytes cached to disk |
-| Unsafe plugin constructor bypass | ✅ Works | `Unsafe.allocateInstance()` + null collection field init |
+| Unsafe plugin constructor bypass | 🟡 In-work | `Unsafe.allocateInstance()` + null collection field init; cascade patterns still being fixed |
 | `/fc load`, `/fc unload`, `/fc reload`, `/fc list` commands | ✅ Works | With tab completion and `foliacompat.admin` permission |
-| Full class hierarchy coverage | ✅ Works | `CraftHumanEntity`, `CraftLivingEntity`, others generated on demand |
+| Full class hierarchy coverage | 🟡 In-work | `CraftHumanEntity`, `CraftLivingEntity`, others generated on demand; experimental, may have errors |
 
 
 
