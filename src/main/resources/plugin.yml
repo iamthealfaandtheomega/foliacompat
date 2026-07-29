@@ -1,0 +1,19 @@
+name: FoliaCompat
+version: ${version}
+main: xyz.vprolabs.foliacompat.FoliaCompat
+load: STARTUP
+folia-supported: true
+api-version: '1.19'
+description: Loads and transforms Bukkit/Spigot/Paper plugins to work on Folia
+
+commands:
+  foliacompat:
+    aliases: [fc]
+    description: Manage FoliaCompat-loaded plugins
+    usage: /<command> <load|unload|reload|list> [name]
+    permission: foliacompat.admin
+
+permissions:
+  foliacompat.admin:
+    description: Allows use of /foliacompat command
+    default: op

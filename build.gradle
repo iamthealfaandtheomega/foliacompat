@@ -1,0 +1,39 @@
+plugins {
+    id 'java'
+}
+
+group = 'xyz.vprolabs'
+version = '1.0.0'
+
+repositories {
+    mavenCentral()
+    maven {
+        name = "papermc-repo"
+        url = "https://repo.papermc.io/repository/maven-public/"
+    }
+}
+
+dependencies {
+    compileOnly "dev.folia:folia-api:1.19.4-R0.1-SNAPSHOT"
+}
+
+java {
+    toolchain {
+        languageVersion.set(JavaLanguageVersion.of(21))
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 17
+    options.compilerArgs.addAll(['-Xlint:all'])
+}
+
+tasks.processResources {
+    def props = [version: version]
+    inputs.properties props
+    filteringCharset = 'UTF-8'
+    filesMatching('plugin.yml') {
+        expand props
+    }
+}

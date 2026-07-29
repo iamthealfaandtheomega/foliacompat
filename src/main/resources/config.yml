@@ -1,0 +1,42 @@
+# ============================================================================
+# FoliaCompat Configuration
+# ============================================================================
+# FoliaCompat bridges Spigot/Paper plugins onto Folia's threaded region server
+# by injecting a Folia-aware scheduler and patching plugin bytecode at load
+# time. Most settings here are for debugging and error reporting.
+# ============================================================================
+
+# --- Internal config version ---
+# Do not change. Auto-incremented when the plugin adds or changes config keys.
+config-version: 4
+
+# --- Plugin cache ---
+# When true: deletes all cached patched jars on every server restart.
+# When false (default): patches are cached and reused across restarts,
+#   which speeds up subsequent starts significantly.
+# Enable this only when debugging plugin loading/bytecode-patching issues.
+reset-cache-on-restart: false
+
+# --- Error reporting ---
+# FoliaCompat can anonymously report plugin errors to the developer via
+# vProLabs' public error webhook (https://www.vprolabs.xyz/api/public-error-webhook).
+# The data collected includes: plugin name, error message, stack trace,
+# server version, and FoliaCompat version. No player data or IP addresses
+# are sent. This helps identify and fix issues in plugin compatibility.
+# Set to false to disable all error reporting.
+error-reporting:
+  enabled: true
+
+# --- Modrinth update checking ---
+# When true: checks Modrinth for new versions at startup and logs a warning if
+#   a newer version is available.
+# When false: no update check is performed.
+modrinth-update-check: true
+
+# --- Debug logging ---
+# When true: enables verbose debug output for plugin classloading, bytecode
+#   patching, scheduler injection, and mapping resolution.
+# When false (default): only normal log messages are shown (plugin load/unload
+#   results, errors, and summary info).
+# Enable this only when troubleshooting plugin compatibility issues.
+debug: false
