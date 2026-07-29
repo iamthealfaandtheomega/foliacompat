@@ -29,7 +29,6 @@ FoliaCompat is a zero-dependency drop-in plugin that bridges every Bukkit/Paper 
 | Dynamic bridge class generation | ✅ Works | Extends `CraftScheduler` at runtime via ASM + `MethodHandles.defineClass()` — type-safe, no vtable corruption, works on JDK 21/25 |
 | Shutdown crash protection (SIGSEGV) | ✅ Fixed | Bridge class eliminates vtable mismatch — no more `LinkResolver::runtime_resolve_virtual_method` crashes |
 | Shutdown NPE protection | ✅ Fixed | Daemon watcher + instance protection + re-injection; no more `CraftScheduler.getActiveWorkers()` null |
-| Scheduler error reporting to Discord | ✅ Works | All scheduler lambdas wrapped with `DiscordReporter.report()` on Throwable |
 | Plugin bytecode patching (NMS → mapped names) | ✅ Works | Constant pool Utf8 rewriting at `findClass()` time via custom classloader |
 | Plugin bytecode patching (CraftBukkit renames) | ⚠️ Experimental | Runtime-probed fallback map + hardcoded fallbacks; version-dependent |
 | Synthetic CraftBukkit entity classes | ⚠️ Experimental | `CraftHumanEntity` → `CraftEntity`, `CraftLivingEntity` → `CraftEntity`; hierarchy guessed, some edge cases |
