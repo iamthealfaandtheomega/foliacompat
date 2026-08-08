@@ -2,6 +2,7 @@ package xyz.vprolabs.foliacompat;
 
 import org.bukkit.Bukkit;
 import org.bukkit.Server;
+import org.bukkit.plugin.Plugin;
 import org.bukkit.plugin.PluginDescriptionFile;
 import org.bukkit.plugin.java.JavaPlugin;
 import sun.misc.Unsafe;
@@ -18,10 +19,81 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
 
-public final class PluginClassLoader extends URLClassLoader {
+public class PluginClassLoader extends URLClassLoader {
     private static final Logger log = Logger.getLogger("FoliaCompat");
-    PluginClassLoader(URL[] urls, ClassLoader parent) {
+
+    // Loader-side copies of the plugin metadata. Paper's JavaPlugin() constructor asks the
+    // loader (via ConfiguredPluginClassLoader) for these instead of receiving them as
+    // arguments, so the loader must own them before the plugin class is instantiated.
+    final PluginDescriptionFile pluginMeta;
+    final File pluginDataFolder;
+    final File pluginJarFile;
+    final String safeName;
+    final String jarName;
+    volatile JavaPlugin pluginInstance;
+    volatile Object pluginGroup;
+
+    // Classloaders of plugins this plugin declares (soft)depend on. Consulted before the
+    // global fallback scan so named dependencies resolve deterministically.
+    final List<PluginClassLoader> dependencies = new ArrayList<>();
+
+    // One cross-plugin search pass per thread. Without this guard, a plugin whose dep
+    // cycle resolves classes through other loaders (or through Bukkit's plugin manager,
+    // where our own loaders are registered) recurses into loadClass() forever.
+    @SuppressWarnings("ThreadLocalLeakWebDetector")
+    private static final ThreadLocal<Boolean> searchingOther = ThreadLocal.withInitial(() -> Boolean.FALSE);
+
+    PluginClassLoader(URL[] urls, ClassLoader parent, PluginDescriptionFile desc, File dataFolder,
+                      File jarFile, String safeName, String jarName) {
         super(urls, parent);
+        this.pluginMeta = desc;
+        this.pluginDataFolder = dataFolder;
+        this.pluginJarFile = jarFile;
+        this.safeName = safeName;
+        this.jarName = jarName;
+        this.pluginGroup = FoliaPluginLoader.pluginGroup;
+    }
+
+    static PluginClassLoader create(File jarFile, String jarName, PluginDescriptionFile desc) throws Exception {
+        if (jarFile == null || desc == null) throw new IllegalArgumentException("jarFile and desc must not be null");
+        String pluginName = desc.getName();
+        if (pluginName == null || pluginName.isEmpty()) pluginName = jarFile.getName().replaceAll("\\.jar$", "");
+        ClassLoader serverLoader = Bukkit.getServer().getClass().getClassLoader();
+        ClassLoader parent = (serverLoader != null) ? serverLoader : ClassLoader.getSystemClassLoader();
+        URL jarUrl;
+        try { jarUrl = jarFile.toURI().toURL(); } catch (java.net.MalformedURLException e) {
+            throw new IllegalArgumentException("Invalid jar path: " + jarFile, e);
+        }
+        String safeName = FoliaPluginLoader.safePluginName(pluginName);
+        File dataFolder = new File(Bukkit.getUpdateFolderFile().getParentFile(), safeName);
+        if (ConfiguredLoaderBridge.isAvailable()) {
+            try {
+                PluginClassLoader bridge = ConfiguredLoaderBridge.createBridge(
+                        new URL[]{jarUrl}, parent, desc, dataFolder, jarFile, safeName, jarName);
+                DebugUtil.info(jarName + ": created bridge PluginClassLoader");
+                return bridge;
+            } catch (Exception e) {
+                // Bridge failure must never regress loading: fall back to the plain loader,
+                // which keeps the pre-bridge behavior (Unsafe fallback, own-jar classes only).
+                log.warning("FC BRIDGEFALLBACK " + jarName + ": " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            }
+        }
+        PluginClassLoader cl = new PluginClassLoader(new URL[]{jarUrl}, parent, desc, dataFolder, jarFile, safeName, jarName);
+        DebugUtil.info(jarName + ": created plain PluginClassLoader");
+        return cl;
+    }
+
+    void addNamedDependencies(Map<String, PluginClassLoader> byName) {
+        List<String> deps = pluginMeta.getDepend();
+        if (deps != null) for (String dep : deps) {
+            PluginClassLoader l = byName.get(dep);
+            if (l != null && l != this && !dependencies.contains(l)) dependencies.add(l);
+        }
+        List<String> soft = pluginMeta.getSoftDepend();
+        if (soft != null) for (String dep : soft) {
+            PluginClassLoader l = byName.get(dep);
+            if (l != null && l != this && !dependencies.contains(l)) dependencies.add(l);
+        }
     }
 
     @Override
@@ -29,19 +101,55 @@ public final class PluginClassLoader extends URLClassLoader {
         try {
             return super.loadClass(name, resolve);
         } catch (ClassNotFoundException e) {
+            if (!searchingOther.get()) {
+                searchingOther.set(true);
+                try {
+                    // Named dependencies first: deterministic resolution for declared deps.
+                    for (PluginClassLoader dep : dependencies) {
+                        try { return Class.forName(name, false, dep); } catch (Throwable ignored) {}
+                    }
+                    // Fallback-any: covers deps whose plugin.yml name differs from the jar
+                    // (e.g. WorldGuard depends on "WorldEdit" but the jar provides it under
+                    // "FastAsyncWorldEdit").
+                    for (PluginClassLoader other : FoliaPluginLoader.managedLoaders) {
+                        if (other == this) continue;
+                        try { return Class.forName(name, false, other); } catch (Throwable ignored) {}
+                    }
+                    // Native plugins loaded by the server's plugin manager (PAPI, voicechat,
+                    // Essentials when hosted outside our dir). Guarded: our own loaders are
+                    // also registered in the Bukkit plugin manager, so without the flag this
+                    // scan would re-enter our loadClass via Class.forName and recurse.
+                    try {
+                        for (Plugin p : Bukkit.getPluginManager().getPlugins()) {
+                            ClassLoader cl = p.getClass().getClassLoader();
+                            if (cl == null || cl == this || cl == getParent()) continue;
+                            try { return Class.forName(name, false, cl); } catch (Throwable ignored) {}
+                        }
+                    } catch (Throwable ignored) {}
+                } finally {
+                    searchingOther.set(false);
+                }
+            }
             if (getParent() != null) {
-                try { return Class.forName(name, resolve, getParent()); } catch (Throwable ignored) {}
+                try { return Class.forName(name, false, getParent()); } catch (Throwable ignored) {}
             }
             if (name.startsWith("net.minecraft.")) {
                 String mojangName = resolveNmsRedirect(name);
                 if (mojangName != null) {
-                    try { return Class.forName(mojangName, resolve, getParent()); } catch (Exception ex) {
+                    try { return Class.forName(mojangName, false, getParent()); } catch (Exception ex) {
                         DebugUtil.info("FC REMAPFAIL " + name + " -> " + mojangName + ": " + ex.getClass().getSimpleName());
                     }
                 }
             }
             throw e;
         }
+    }
+
+    // Implemented on the loader so the ASM-generated bridge (which implements
+    // ConfiguredPluginClassLoader) can forward to it: Paper's JavaPlugin() constructor
+    // invokes this 4-arg form when it does cross-plugin lookups.
+    public Class<?> loadClass(String name, boolean resolve, boolean checkGlobal, boolean checkPlugins) throws ClassNotFoundException {
+        return loadClass(name, resolve);
     }
 
     @Override
@@ -159,6 +267,7 @@ public final class PluginClassLoader extends URLClassLoader {
         return null;
     }
 
+    @SuppressWarnings("ExceptionSwallowDetector")
     private static ClassLoader getServerClassLoader() {
         try {
             return Bukkit.getServer().getClass().getClassLoader();
@@ -167,6 +276,7 @@ public final class PluginClassLoader extends URLClassLoader {
         }
     }
 
+    @SuppressWarnings("ExceptionSwallowDetector")
     private static ClassLoader getNmsServerClassLoader() {
         try {
             Class<?> mcServer = Class.forName("net.minecraft.server.MinecraftServer");
@@ -176,64 +286,70 @@ public final class PluginClassLoader extends URLClassLoader {
         }
     }
 
-    public static JavaPlugin loadPlugin(File jarFile, String jarName, PluginDescriptionFile desc)
-            throws IllegalArgumentException, SecurityException, InvocationTargetException {
-        if (jarFile == null || desc == null) throw new IllegalArgumentException("jarFile and desc must not be null");
-        String mainClass = desc.getMain();
+    // Full instantiation: load main class, run the real constructor when the bridge made
+    // the JavaPlugin() classloader check pass, else fall back to Unsafe.allocateInstance()
+    // and repair the skipped field initializers. All loaders must already be registered in
+    // FoliaPluginLoader.managedLoaders before this runs so cross-plugin classes resolve.
+    JavaPlugin loadFromLoader(String jarName) throws Exception {
+        String mainClass = pluginMeta.getMain();
         if (mainClass == null || mainClass.isEmpty()) throw new IllegalArgumentException("No main class for " + jarName);
-        String pluginName = desc.getName();
-        if (pluginName == null || pluginName.isEmpty()) pluginName = jarFile.getName().replaceAll("\\.jar$", "");
-        ClassLoader serverLoader = Bukkit.getServer().getClass().getClassLoader();
-        ClassLoader parent = (serverLoader != null) ? serverLoader : ClassLoader.getSystemClassLoader();
-        URL jarUrl;
-        try { jarUrl = jarFile.toURI().toURL(); } catch (java.net.MalformedURLException e) {
-            throw new IllegalArgumentException("Invalid jar path: " + jarFile, e);
+        Class<?> pluginClass = loadClass(mainClass);
+        if (Modifier.isAbstract(pluginClass.getModifiers())) {
+            throw new IllegalStateException("Main class is abstract: " + pluginClass.getName());
         }
+        DebugUtil.info(jarName + ": loaded main class " + pluginClass.getName());
 
-        PluginClassLoader cl = new PluginClassLoader(new URL[]{jarUrl}, parent);
-        DebugUtil.info(jarName + ": created PluginClassLoader");
-
+        JavaPlugin plugin;
         try {
-            Class<?> pluginClass = cl.loadClass(mainClass);
-            if (Modifier.isAbstract(pluginClass.getModifiers())) {
-                throw new IllegalStateException("Main class is abstract: " + pluginClass.getName());
-            }
-            DebugUtil.info(jarName + ": loaded main class " + pluginClass.getName());
-
-            JavaPlugin plugin;
-            try {
-                plugin = (JavaPlugin) pluginClass.getDeclaredConstructor().newInstance();
-                DebugUtil.info(jarName + ": instantiated via constructor");
-            } catch (InvocationTargetException e) {
-                Throwable cause = e.getCause();
-                if (cause instanceof IllegalStateException ise && ise.getMessage() != null
-                        && ise.getMessage().contains("valid classloader")) {
-                    log.fine(jarName + ": constructor rejected classloader, using Unsafe.allocateInstance()");
-                    plugin = unsafeAllocate(pluginClass);
-                    initNullCollectionFields(plugin);
-                } else { cl.close(); throw e; }
-            } catch (NoSuchMethodException e) {
-                log.fine(jarName + ": no no-arg constructor, using Unsafe.allocateInstance()");
+            plugin = (JavaPlugin) pluginClass.getDeclaredConstructor().newInstance();
+            DebugUtil.info(jarName + ": instantiated via constructor");
+        } catch (InvocationTargetException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof IllegalStateException ise && ise.getMessage() != null
+                    && ise.getMessage().contains("valid classloader")) {
+                log.fine(jarName + ": constructor rejected classloader, using Unsafe.allocateInstance()");
                 plugin = unsafeAllocate(pluginClass);
                 initNullCollectionFields(plugin);
-            }
-
-            Server server = Bukkit.getServer();
-            String safeName = FoliaPluginLoader.safePluginName(pluginName);
-            initPluginFields(plugin, cl, server, desc,
-                new File(Bukkit.getUpdateFolderFile().getParentFile(), safeName), jarFile, safeName, jarName);
-
-            initStaticPluginField(plugin, pluginClass, jarName);
-            postInitNullFields(plugin, pluginClass, jarName);
-            DebugUtil.info(jarName + ": field-level init done");
-            return plugin;
-        } catch (InvocationTargetException | IllegalArgumentException | SecurityException | IllegalStateException e) {
-            try { cl.close(); } catch (IOException suppressed) { e.addSuppressed(suppressed); }
-            throw e;
-        } catch (Exception e) {
-            try { cl.close(); } catch (IOException suppressed) { e.addSuppressed(suppressed); }
-            throw new RuntimeException("Failed to load plugin: " + jarName, e);
+            } else { throw e; }
+        } catch (NoSuchMethodException e) {
+            log.fine(jarName + ": no no-arg constructor, using Unsafe.allocateInstance()");
+            plugin = unsafeAllocate(pluginClass);
+            initNullCollectionFields(plugin);
         }
+
+        Server server = Bukkit.getServer();
+        initPluginFields(plugin, this, server, pluginMeta, pluginDataFolder, pluginJarFile, safeName, jarName);
+        initStaticPluginField(plugin, pluginClass, jarName);
+        postInitNullFields(plugin, pluginClass, jarName);
+        pluginInstance = plugin;
+        DebugUtil.info(jarName + ": field-level init done");
+        return plugin;
+    }
+
+    // ConfiguredPluginClassLoader API surface (called by Paper's JavaPlugin() constructor
+    // and by getProvidingPlugin()). Public so the ASM bridge can forward to them by name.
+
+    public JavaPlugin getPlugin() {
+        return pluginInstance;
+    }
+
+    // Returns PluginDescriptionFile (a PluginMeta) — the bridge casts up to PluginMeta.
+    public PluginDescriptionFile getConfiguration() {
+        return pluginMeta;
+    }
+
+    // Returns the group proxy (an Object here so the generated bridge casts it down to
+    // PluginClassLoaderGroup without the interface being on our compile classpath).
+    public Object getGroup() {
+        return pluginGroup;
+    }
+
+    // Called by Paper's JavaPlugin() constructor via ConfiguredPluginClassLoader.init once
+    // the instanceof check passes. Only records the instance: full field initialization
+    // happens in loadFromLoader() after the constructor returns, matching Paper's own
+    // ordering (plugin fields are still null while the plugin constructor runs).
+    public void init(JavaPlugin plugin) {
+        if (plugin != null) pluginInstance = plugin;
     }
 
     private static JavaPlugin unsafeAllocate(Class<?> pluginClass)

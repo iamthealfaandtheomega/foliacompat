@@ -134,6 +134,44 @@ public class FoliaCompat extends JavaPlugin {
             DebugUtil.info("FC SCHEDMISS scheduler field was reverted — re-injecting");
             try { injectScheduler(); } catch (Throwable t) { handleError("injectScheduler onEnable", t); }
         }
+        // Retry plugins whose main class was unresolvable at onLoad time: native server
+        // plugins loaded after us (voicechat, ajQueue, ...) now have classes reachable
+        // through the Bukkit plugin manager. Newly loaded plugins get registered and
+        // onLoad() called, then take part in the normal enable pass below.
+        List<ManagedPlugin> retried = FoliaPluginLoader.retryFailedLoads();
+        for (ManagedPlugin mp : retried) {
+            if (mp == null) continue;
+            String pname = mp.getName() != null ? mp.getName() : "Unknown";
+            Plugin plugin = mp.plugin();
+            ClassLoader cl = mp.classLoader();
+            if (plugin == null || cl == null) {
+                debug("  " + pname + ": retried plugin is null — skipping");
+                loadedPlugins.add(mp);
+                continue;
+            }
+            try {
+                debug("  Registering " + pname + " (retried)...");
+                FoliaPluginLoader.registerPlugin(plugin);
+                debug("  Calling onLoad() for " + pname + " (retried)...");
+                FoliaPluginLoader.callWithTCCL(() -> {
+                    try { plugin.onLoad(); } catch (Throwable t) { throw new RuntimeException(t); }
+                    return null;
+                }, cl);
+                mp.setEnabled(true);
+                debug(pname + ": LOADED OK (retried)");
+            } catch (RuntimeException e) {
+                mp.setEnabled(false);
+                Throwable cause = e.getCause() != null ? e.getCause() : e;
+                handleError(pname + " onLoad (retried)", cause);
+                LogUtil.warn("  " + pname + ": FAILED on load (retried): " + cause.getClass().getSimpleName() + ": " + cause.getMessage());
+            } catch (Exception e) {
+                mp.setEnabled(false);
+                Throwable cause = e.getCause() != null ? e.getCause() : e;
+                handleError(pname + " onLoad (retried)", cause);
+                LogUtil.warn("  " + pname + ": FAILED on load (retried): " + cause.getClass().getSimpleName() + ": " + cause.getMessage());
+            }
+            loadedPlugins.add(mp);
+        }
         getCommand("foliacompat").setExecutor(new FoliaCompatCommand(this, new File(getDataFolder(), "plugins")));
         try { new Metrics(this, 32962); } catch (Exception ignored) {}
         checkForUpdates();

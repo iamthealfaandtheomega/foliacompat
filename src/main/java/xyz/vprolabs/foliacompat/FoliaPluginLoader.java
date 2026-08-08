@@ -3,18 +3,16 @@ package xyz.vprolabs.foliacompat;
 import org.bukkit.Bukkit;
 import org.bukkit.plugin.Plugin;
 import org.bukkit.plugin.InvalidDescriptionException;
-import org.bukkit.plugin.InvalidPluginException;
 import org.bukkit.plugin.PluginDescriptionFile;
 import org.bukkit.plugin.PluginLoader;
 import org.bukkit.plugin.SimplePluginManager;
-import org.bukkit.plugin.java.JavaPluginLoader;
+import org.bukkit.plugin.java.JavaPlugin;
 import xyz.vprolabs.foliacompat.ErrorReporter;
 
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.Field;
-import java.lang.reflect.InvocationTargetException;
 import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -25,6 +23,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 import java.util.logging.Logger;
@@ -38,6 +38,16 @@ public final class FoliaPluginLoader {
     private static String pluginVersion = "1.0.0";
     static volatile Object cachedBytecodeModifier;
     static volatile java.lang.reflect.Method cachedBytecodeModifyMethod;
+
+    // All loaders we created, registered BEFORE any main class is instantiated so that
+    // cross-plugin class resolution sees the full set (fallback-any in PluginClassLoader).
+    static final List<PluginClassLoader> managedLoaders = new CopyOnWriteArrayList<>();
+    // plugin.yml name -> loader, for named depend/softdepend resolution.
+    static final Map<String, PluginClassLoader> loadersByPluginName = new ConcurrentHashMap<>();
+    // Loaders whose main class failed to instantiate at load time (unresolvable native
+    // deps, e.g. voicechat loads after us). Retried in FoliaCompat.onEnable().
+    static final List<PreparedPlugin> failedPrepared = new CopyOnWriteArrayList<>();
+    static volatile Object pluginGroup;
 
     private FoliaPluginLoader() {}
 
@@ -63,6 +73,10 @@ public final class FoliaPluginLoader {
         }
         PaperRemapperBridge.resolveBytecodeModifier();
         BytecodePatcher.initInterfaceClasses();
+        // Warm the ConfiguredPluginClassLoader probe and build the PluginClassLoaderGroup
+        // proxy once: every loader copies the group reference in its constructor.
+        ConfiguredLoaderBridge.isAvailable();
+        pluginGroup = ConfiguredLoaderBridge.createPluginGroup();
     }
     public static void setPluginVersion(String v) { if (v != null && !v.isEmpty()) pluginVersion = v; }
     public static String getVersion() { return pluginVersion; }
@@ -78,6 +92,9 @@ public final class FoliaPluginLoader {
 
         jars = sortByDependencies(jars);
 
+        // Phase 1: parse every plugin.yml and create the classloaders. No class loading
+        // yet — the loaders must first ALL be visible to each other.
+        List<PreparedPlugin> prepared = new ArrayList<>();
         for (File jarFile : jars) {
             try {
                 String jarName = jarFile.getName();
@@ -86,17 +103,43 @@ public final class FoliaPluginLoader {
                     DebugUtil.info(jarName + ": plugin '" + pluginName + "' already loaded, skipping");
                     continue;
                 }
-                Plugin plugin = loadPlugin(jarFile, jarName);
-                if (plugin != null) {
-                    ClassLoader cl = plugin.getClass().getClassLoader();
-                    loaded.add(new ManagedPlugin(plugin, cl));
-                } else {
-                    log.warning(jarName + ": loadPlugin returned null");
-                }
+                PluginDescriptionFile desc = readDescription(jarFile);
+                if (desc == null) { log.warning(jarName + ": cannot parse plugin.yml"); continue; }
+                if (desc.getMain() == null || desc.getMain().isEmpty()) { log.warning(jarName + ": no main class"); continue; }
+                if (pluginName == null || pluginName.isEmpty()) pluginName = jarFile.getName().replaceAll("\\.jar$", "");
+                File loadFrom = resolveLoadFile(jarFile, jarName);
+                PluginClassLoader cl = PluginClassLoader.create(loadFrom, jarName, desc);
+                prepared.add(new PreparedPlugin(cl, pluginName, jarName));
             } catch (Throwable e) {
-                LogUtil.warn("Failed to load plugin: " + jarFile.getName() + " " + e.getClass().getSimpleName() + ": " + e.getMessage());
+                LogUtil.warn("Failed to prepare plugin: " + jarFile.getName() + " " + e.getClass().getSimpleName() + ": " + e.getMessage());
                 ErrorReporter.report(jarFile.getName(), e);
-                if (e instanceof VirtualMachineError) throw e;
+                if (e instanceof VirtualMachineError vme) throw vme;
+            }
+        }
+
+        // Phase 2: register every loader, then wire named dependencies. This must happen
+        // before instantiation: a plugin's main class may extend or reference classes in
+        // any other plugin's jar (EssentialsXSpawn -> Essentials, WorldGuard -> WE-in-FAWE).
+        for (PreparedPlugin p : prepared) {
+            managedLoaders.add(p.loader);
+            loadersByPluginName.put(p.pluginName, p.loader);
+        }
+        for (PreparedPlugin p : prepared) {
+            p.loader.addNamedDependencies(loadersByPluginName);
+        }
+
+        // Phase 3: instantiate main classes. Failures go to failedPrepared for the
+        // onEnable retry (their native dependency may not be loaded by the server yet).
+        for (PreparedPlugin p : prepared) {
+            try {
+                JavaPlugin plugin = p.loader.loadFromLoader(p.jarName);
+                loaded.add(new ManagedPlugin(plugin, p.loader));
+                DebugUtil.info(p.jarName + ": instantiated OK");
+            } catch (Throwable e) {
+                LogUtil.warn("Failed to instantiate plugin: " + p.jarName + " " + e.getClass().getSimpleName() + ": " + e.getMessage());
+                ErrorReporter.report(p.jarName, e);
+                failedPrepared.add(p);
+                if (e instanceof VirtualMachineError vme) throw vme;
             }
         }
         LogUtil.info("Loaded plugins:" + loaded.size());
@@ -185,74 +228,90 @@ public final class FoliaPluginLoader {
 
     private static record DepInfo(List<String> depends, List<String> softDepends) {}
 
+    private static record PreparedPlugin(PluginClassLoader loader, String pluginName, String jarName) {}
+
     static Plugin loadPlugin(File jarFile, String jarName) {
         if (jarFile == null) { log.warning("loadPlugin: jarFile is null"); return null; }
+        PluginDescriptionFile desc = readDescription(jarFile);
+        if (desc == null) { log.warning(jarName + ": cannot parse plugin.yml"); return null; }
+        if (desc.getMain() == null || desc.getMain().isEmpty()) { log.warning(jarName + ": no main class"); return null; }
+        String pluginName = desc.getName();
+        if (pluginName == null || pluginName.isEmpty()) pluginName = jarFile.getName().replaceAll("\\.jar$", "");
+        try {
+            File loadFrom = resolveLoadFile(jarFile, jarName);
+            PluginClassLoader cl = PluginClassLoader.create(loadFrom, jarName, desc);
+            // Register immediately: other plugins (and later /fc loads) must see this loader.
+            managedLoaders.add(cl);
+            loadersByPluginName.put(pluginName, cl);
+            cl.addNamedDependencies(loadersByPluginName);
+            return cl.loadFromLoader(jarName);
+        } catch (Exception e) {
+            log.warning(jarName + ": load failed (" + e.getClass().getName() + ": " + e.getMessage() + ")");
+            ErrorReporter.report(jarName, e);
+            return null;
+        }
+    }
 
-        PluginDescriptionFile desc = null;
-        String mainClass = null;
-        String pluginName;
+    private static PluginDescriptionFile readDescription(File jarFile) {
         try (JarFile jf = new JarFile(jarFile)) {
             JarEntry entry = jf.getJarEntry("plugin.yml");
             if (entry == null) entry = jf.getJarEntry("plugin.yaml");
-            if (entry == null) throw new IllegalArgumentException("No plugin.yml in " + jarFile.getName());
-            try (InputStream in = jf.getInputStream(entry)) { desc = new PluginDescriptionFile(in); }
-            pluginName = desc.getName();
-            mainClass = desc.getMain();
+            if (entry == null) return null;
+            try (InputStream in = jf.getInputStream(entry)) { return new PluginDescriptionFile(in); }
         } catch (IOException | IllegalArgumentException | InvalidDescriptionException | NullPointerException e) {
-            log.warning(jarName + ": cannot parse plugin.yml: " + e.getClass().getSimpleName() + " - " + e.getMessage());
             return null;
         }
-        if (mainClass == null || mainClass.isEmpty()) { log.warning(jarName + ": no main class"); return null; }
-        if (pluginName == null || pluginName.isEmpty()) pluginName = jarFile.getName().replaceAll("\\.jar$", "");
-        DebugUtil.info(jarName + ": parsed plugin.yml, main=" + mainClass + ", name=" + pluginName + ", version=" + (desc != null ? desc.getVersion() : "?"));
-
-        Plugin plugin = null;
-        if (pluginCache != null) {
-            try {
-                File cachedJar = pluginCache.getCachedJar(jarFile);
-                if (cachedJar != null) {
-                    try {
-                        plugin = loadWithJavaPluginLoader(cachedJar);
-                        DebugUtil.info("FC PATH " + jarName + ": cached (JavaPluginLoader)");
-                    } catch (IOException | IllegalStateException | UnsupportedOperationException | SecurityException e) {
-                        DebugUtil.info("FC PATH " + jarName + ": cache failed (" + e.getClass().getSimpleName() + "), re-patching...");
-                    }
-                } else { DebugUtil.info("FC PATH " + jarName + ": cache miss, using URLClassLoader"); }
-            } catch (Exception e) { log.fine(jarName + ": cache check error: " + e.getClass().getSimpleName()); }
-        }
-
-        if (plugin == null) {
-            try {
-                if (pluginCache != null) {
-                    File patchedJar = pluginCache.createCachedJar(jarFile);
-                    PluginRegistrar.copyToMainPlugins(jarFile, patchedJar);
-                    java.nio.file.Path remappedJar = PaperRemapperBridge.remapJarViaPaper(jarFile);
-                    if (remappedJar == null) remappedJar = PaperRemapperBridge.findExistingRemappedJar(patchedJar);
-                    if (remappedJar == null) remappedJar = PaperRemapperBridge.remapJarViaPaper(patchedJar);
-                    File loadFrom = (remappedJar != null) ? remappedJar.toFile() : jarFile;
-                    plugin = PluginClassLoader.loadPlugin(loadFrom, jarName, desc);
-                    if (remappedJar != null) DebugUtil.info(jarName + ": loaded from paper-remapped jar");
-                } else {
-                    plugin = PluginClassLoader.loadPlugin(jarFile, jarName, desc);
-                }
-            } catch (InvocationTargetException e) {
-                Throwable root = e.getCause() != null ? e.getCause() : e;
-                log.warning(jarName + ": load failed (" + root.getClass().getName() + ": " + root.getMessage() + ")");
-                ErrorReporter.report(jarName, e);
-            } catch (Exception e) {
-                log.warning(jarName + ": all load methods failed (" + e.getClass().getName() + ": " + e.getMessage() + ")");
-                ErrorReporter.report(jarName, e);
-            }
-        }
-        return plugin;
     }
 
-    private static Plugin loadWithJavaPluginLoader(File jarFile) throws IOException, IllegalStateException, UnsupportedOperationException, InvalidPluginException {
-        if (jarFile == null) throw new IllegalArgumentException("jarFile must not be null");
-        if (!(hostLoader instanceof JavaPluginLoader jpl)) throw new UnsupportedOperationException("hostLoader is not a JavaPluginLoader");
-        Plugin p = jpl.loadPlugin(jarFile);
-        if (p == null) throw new IllegalStateException("JavaPluginLoader.loadPlugin returned null");
-        return p;
+    // Cache/remap pipeline: produces the jar to actually load from. On Folia the Paper
+    // remapper and the JavaPluginLoader cache path are inert (hostLoader is null, no
+    // IMappingFile), so this normally returns the original jar; the machinery is kept
+    // because it is harmless and may help on hybrid setups.
+    private static File resolveLoadFile(File jarFile, String jarName) {
+        File loadFrom = jarFile;
+        if (pluginCache == null) return loadFrom;
+        try {
+            File patchedJar = pluginCache.createCachedJar(jarFile);
+            PluginRegistrar.copyToMainPlugins(jarFile, patchedJar);
+            java.nio.file.Path remappedJar = PaperRemapperBridge.remapJarViaPaper(jarFile);
+            if (remappedJar == null) remappedJar = PaperRemapperBridge.findExistingRemappedJar(patchedJar);
+            if (remappedJar == null) remappedJar = PaperRemapperBridge.remapJarViaPaper(patchedJar);
+            if (remappedJar != null) {
+                loadFrom = remappedJar.toFile();
+                DebugUtil.info(jarName + ": loaded from paper-remapped jar");
+            }
+        } catch (Exception e) {
+            log.fine(jarName + ": cache/remap skipped (" + e.getClass().getSimpleName() + "): " + e.getMessage());
+        }
+        return loadFrom;
+    }
+
+    // Re-attempts instantiation for plugins that failed at load time. Run at onEnable:
+    // native plugins the server loads after us (voicechat, ...) now have classes that
+    // our loadClass can reach through the Bukkit plugin manager.
+    public static List<ManagedPlugin> retryFailedLoads() {
+        List<ManagedPlugin> loaded = new ArrayList<>();
+        if (failedPrepared.isEmpty()) return loaded;
+        DebugUtil.info("FC RETRY retrying " + failedPrepared.size() + " failed plugin(s)");
+        for (PreparedPlugin p : failedPrepared) {
+            try {
+                JavaPlugin plugin = p.loader.loadFromLoader(p.jarName);
+                loaded.add(new ManagedPlugin(plugin, p.loader));
+                DebugUtil.info("FC RETRYOK " + p.jarName);
+            } catch (Throwable e) {
+                LogUtil.warn("FC RETRYFAIL " + p.jarName + ": " + e.getClass().getSimpleName() + ": " + e.getMessage());
+                ErrorReporter.report(p.jarName + " (retry)", e);
+            }
+        }
+        failedPrepared.clear();
+        return loaded;
+    }
+
+    static Class<?> findClassAcrossLoaders(String name) {
+        for (PluginClassLoader cl : managedLoaders) {
+            try { return Class.forName(name, false, cl); } catch (Throwable ignored) {}
+        }
+        return null;
     }
 
     static String safePluginName(String raw) {
